@@ -3,7 +3,6 @@ package api
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"reflect"
@@ -162,15 +161,10 @@ func (r *GenerateResponse) Summary() {
 	}
 }
 
-type Options struct {
-	Seed int `json:"seed,omitempty"`
-
-	// Backend options
-	UseNUMA bool `json:"numa,omitempty"`
-
-	// Model options
+// Runner options which must be set when the model is loaded into memory
+type Runner struct {
+	UseNUMA            bool    `json:"numa,omitempty"`
 	NumCtx             int     `json:"num_ctx,omitempty"`
-	NumKeep            int     `json:"num_keep,omitempty"`
 	NumBatch           int     `json:"num_batch,omitempty"`
 	NumGQA             int     `json:"num_gqa,omitempty"`
 	NumGPU             int     `json:"num_gpu,omitempty"`
@@ -184,8 +178,15 @@ type Options struct {
 	EmbeddingOnly      bool    `json:"embedding_only,omitempty"`
 	RopeFrequencyBase  float32 `json:"rope_frequency_base,omitempty"`
 	RopeFrequencyScale float32 `json:"rope_frequency_scale,omitempty"`
+	NumThread          int     `json:"num_thread,omitempty"`
+}
 
-	// Predict options
+type Options struct {
+	Runner
+
+	// Predict options used at runtime
+	NumKeep          int      `json:"num_keep,omitempty"`
+	Seed             int      `json:"seed,omitempty"`
 	NumPredict       int      `json:"num_predict,omitempty"`
 	TopK             int      `json:"top_k,omitempty"`
 	TopP             float32  `json:"top_p,omitempty"`
@@ -201,9 +202,9 @@ type Options struct {
 	MirostatEta      float32  `json:"mirostat_eta,omitempty"`
 	PenalizeNewline  bool     `json:"penalize_newline,omitempty"`
 	Stop             []string `json:"stop,omitempty"`
-
-	NumThread int `json:"num_thread,omitempty"`
 }
+
+var ErrInvalidOpts = fmt.Errorf("invalid options")
 
 func (opts *Options) FromMap(m map[string]interface{}) error {
 	valueOpts := reflect.ValueOf(opts).Elem() // names of the fields in the options struct
@@ -218,6 +219,7 @@ func (opts *Options) FromMap(m map[string]interface{}) error {
 		}
 	}
 
+	invalidOpts := []string{}
 	for key, val := range m {
 		if opt, ok := jsonOpts[key]; ok {
 			field := valueOpts.FieldByName(opt.Name)
@@ -235,44 +237,39 @@ func (opts *Options) FromMap(m map[string]interface{}) error {
 						// when JSON unmarshals numbers, it uses float64, not int
 						field.SetInt(int64(t))
 					default:
-						log.Printf("could not convert model parameter %v of type %T to int, skipped", key, val)
+						return fmt.Errorf("option %q must be of type integer", key)
 					}
 				case reflect.Bool:
 					val, ok := val.(bool)
 					if !ok {
-						log.Printf("could not convert model parameter %v of type %T to bool, skipped", key, val)
-						continue
+						return fmt.Errorf("option %q must be of type boolean", key)
 					}
 					field.SetBool(val)
 				case reflect.Float32:
 					// JSON unmarshals to float64
 					val, ok := val.(float64)
 					if !ok {
-						log.Printf("could not convert model parameter %v of type %T to float32, skipped", key, val)
-						continue
+						return fmt.Errorf("option %q must be of type float32", key)
 					}
 					field.SetFloat(val)
 				case reflect.String:
 					val, ok := val.(string)
 					if !ok {
-						log.Printf("could not convert model parameter %v of type %T to string, skipped", key, val)
-						continue
+						return fmt.Errorf("option %q must be of type string", key)
 					}
 					field.SetString(val)
 				case reflect.Slice:
 					// JSON unmarshals to []interface{}, not []string
 					val, ok := val.([]interface{})
 					if !ok {
-						log.Printf("could not convert model parameter %v of type %T to slice, skipped", key, val)
-						continue
+						return fmt.Errorf("option %q must be of type array", key)
 					}
 					// convert []interface{} to []string
 					slice := make([]string, len(val))
 					for i, item := range val {
 						str, ok := item.(string)
 						if !ok {
-							log.Printf("could not convert model parameter %v of type %T to slice of strings, skipped", key, item)
-							continue
+							return fmt.Errorf("option %q must be of an array of strings", key)
 						}
 						slice[i] = str
 					}
@@ -281,7 +278,13 @@ func (opts *Options) FromMap(m map[string]interface{}) error {
 					return fmt.Errorf("unknown type loading config params: %v", field.Kind())
 				}
 			}
+		} else {
+			invalidOpts = append(invalidOpts, key)
 		}
+	}
+
+	if len(invalidOpts) > 0 {
+		return fmt.Errorf("%w: %v", ErrInvalidOpts, strings.Join(invalidOpts, ", "))
 	}
 	return nil
 }
@@ -306,20 +309,22 @@ func DefaultOptions() Options {
 		PenalizeNewline:  true,
 		Seed:             -1,
 
-		// options set when the model is loaded
-		NumCtx:             2048,
-		RopeFrequencyBase:  10000.0,
-		RopeFrequencyScale: 1.0,
-		NumBatch:           512,
-		NumGPU:             -1, // -1 here indicates that NumGPU should be set dynamically
-		NumGQA:             1,
-		NumThread:          0, // let the runtime decide
-		LowVRAM:            false,
-		F16KV:              true,
-		UseMLock:           false,
-		UseMMap:            true,
-		UseNUMA:            false,
-		EmbeddingOnly:      true,
+		Runner: Runner{
+			// options set when the model is loaded
+			NumCtx:             2048,
+			RopeFrequencyBase:  10000.0,
+			RopeFrequencyScale: 1.0,
+			NumBatch:           512,
+			NumGPU:             -1, // -1 here indicates that NumGPU should be set dynamically
+			NumGQA:             1,
+			NumThread:          0, // let the runtime decide
+			LowVRAM:            false,
+			F16KV:              true,
+			UseMLock:           false,
+			UseMMap:            true,
+			UseNUMA:            false,
+			EmbeddingOnly:      true,
+		},
 	}
 }
 

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -26,7 +25,6 @@ import (
 	"github.com/jmorganca/ollama/api"
 	"github.com/jmorganca/ollama/llm"
 	"github.com/jmorganca/ollama/parser"
-	"github.com/jmorganca/ollama/vector"
 	"github.com/jmorganca/ollama/version"
 )
 
@@ -47,12 +45,10 @@ type Model struct {
 	System        string
 	License       []string
 	Digest        string
-	ConfigDigest  string
 	Options       map[string]interface{}
-	Embeddings    []vector.Embedding
 }
 
-func (m *Model) Prompt(request api.GenerateRequest, embedding string) (string, error) {
+func (m *Model) Prompt(request api.GenerateRequest) (string, error) {
 	t := m.Template
 	if request.Template != "" {
 		t = request.Template
@@ -67,7 +63,6 @@ func (m *Model) Prompt(request api.GenerateRequest, embedding string) (string, e
 		First  bool
 		System string
 		Prompt string
-		Embed  string
 
 		// deprecated: versions <= 0.0.7 used this to omit the system prompt
 		Context []int
@@ -77,7 +72,6 @@ func (m *Model) Prompt(request api.GenerateRequest, embedding string) (string, e
 	vars.System = m.System
 	vars.Prompt = request.Prompt
 	vars.Context = request.Context
-	vars.Embed = embedding
 
 	if request.System != "" {
 		vars.System = request.System
@@ -137,7 +131,7 @@ func (m *ManifestV2) GetTotalSize() (total int64) {
 }
 
 func GetManifest(mp ModelPath) (*ManifestV2, string, error) {
-	fp, err := mp.GetManifestPath(false)
+	fp, err := mp.GetManifestPath()
 	if err != nil {
 		return nil, "", err
 	}
@@ -171,12 +165,11 @@ func GetModel(name string) (*Model, error) {
 	}
 
 	model := &Model{
-		Name:         mp.GetFullTagname(),
-		ShortName:    mp.GetShortTagname(),
-		Digest:       digest,
-		ConfigDigest: manifest.Config.Digest,
-		Template:     "{{ .Prompt }}",
-		License:      []string{},
+		Name:      mp.GetFullTagname(),
+		ShortName: mp.GetShortTagname(),
+		Digest:    digest,
+		Template:  "{{ .Prompt }}",
+		License:   []string{},
 	}
 
 	for _, layer := range manifest.Layers {
@@ -190,15 +183,9 @@ func GetModel(name string) (*Model, error) {
 			model.ModelPath = filename
 			model.OriginalModel = layer.From
 		case "application/vnd.ollama.image.embed":
-			file, err := os.Open(filename)
-			if err != nil {
-				return nil, fmt.Errorf("failed to open file: %s", filename)
-			}
-			defer file.Close()
-
-			if err = json.NewDecoder(file).Decode(&model.Embeddings); err != nil {
-				return nil, err
-			}
+			// Deprecated in versions  > 0.1.2
+			// TODO: remove this warning in a future version
+			log.Print("WARNING: model contains embeddings, but embeddings in modelfiles have been deprecated and will be ignored.")
 		case "application/vnd.ollama.image.adapter":
 			model.AdapterPaths = append(model.AdapterPaths, filename)
 		case "application/vnd.ollama.image.template":
@@ -265,7 +252,7 @@ func filenameWithPath(path, f string) (string, error) {
 	return f, nil
 }
 
-func CreateModel(ctx context.Context, workDir, name string, path string, fn func(resp api.ProgressResponse)) error {
+func CreateModel(ctx context.Context, name string, path string, fn func(resp api.ProgressResponse)) error {
 	mp := ParseModelPath(name)
 
 	var manifest *ManifestV2
@@ -310,13 +297,11 @@ func CreateModel(ctx context.Context, workDir, name string, path string, fn func
 	var layers []*LayerReader
 	params := make(map[string][]string)
 	var sourceParams map[string]any
-	embed := EmbeddingParams{fn: fn}
 	for _, c := range commands {
 		log.Printf("[%s] - %s\n", c.Name, c.Args)
 		switch c.Name {
 		case "model":
 			fn(api.ProgressResponse{Status: "looking for model"})
-			embed.model = c.Args
 
 			mp := ParseModelPath(c.Args)
 			mf, _, err := GetManifest(mp)
@@ -340,7 +325,6 @@ func CreateModel(ctx context.Context, workDir, name string, path string, fn func
 						return err
 					}
 				} else {
-					embed.model = modelFile
 					// create a model from this specified file
 					fn(api.ProgressResponse{Status: "creating model layer"})
 					file, err := os.Open(modelFile)
@@ -421,12 +405,6 @@ func CreateModel(ctx context.Context, workDir, name string, path string, fn func
 					layers = append(layers, newLayer)
 				}
 			}
-		case "embed":
-			embedFilePath, err := filenameWithPath(path, c.Args)
-			if err != nil {
-				return err
-			}
-			embed.files = append(embed.files, embedFilePath)
 		case "adapter":
 			fn(api.ProgressResponse{Status: fmt.Sprintf("creating model %s layer", c.Name)})
 
@@ -517,17 +495,7 @@ func CreateModel(ctx context.Context, workDir, name string, path string, fn func
 		}
 		l.MediaType = "application/vnd.ollama.image.params"
 		layers = append(layers, l)
-
-		// apply these parameters to the embedding options, in case embeddings need to be generated using this model
-		embed.opts = formattedParams
 	}
-
-	// generate the embedding layers
-	embeddingLayers, err := embeddingLayers(workDir, embed)
-	if err != nil {
-		return err
-	}
-	layers = append(layers, embeddingLayers...)
 
 	digests, err := getLayerDigests(layers)
 	if err != nil {
@@ -572,146 +540,6 @@ func CreateModel(ctx context.Context, workDir, name string, path string, fn func
 	return nil
 }
 
-type EmbeddingParams struct {
-	model string
-	opts  map[string]interface{}
-	files []string // paths to files to embed
-	fn    func(resp api.ProgressResponse)
-}
-
-// embeddingLayers loads the associated LLM and generates the embeddings to be stored from an input file
-func embeddingLayers(workDir string, e EmbeddingParams) ([]*LayerReader, error) {
-	layers := []*LayerReader{}
-	if len(e.files) > 0 {
-		// check if the model is a file path or a model name
-		model, err := GetModel(e.model)
-		if err != nil {
-			if !strings.Contains(err.Error(), "couldn't open file") {
-				return nil, fmt.Errorf("unexpected error opening model to generate embeddings: %v", err)
-			}
-			// the model may be a file path, create a model from this file
-			model = &Model{ModelPath: e.model}
-		}
-
-		if err := load(context.Background(), workDir, model, e.opts, defaultSessionDuration); err != nil {
-			return nil, fmt.Errorf("load model to generate embeddings: %v", err)
-		}
-
-		// this will be used to check if we already have embeddings for a file
-		modelInfo, err := os.Stat(model.ModelPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get model file info: %v", err)
-		}
-
-		addedFiles := make(map[string]bool) // keep track of files that have already been added
-		for _, filePattern := range e.files {
-			matchingFiles, err := filepath.Glob(filePattern)
-			if err != nil {
-				return nil, fmt.Errorf("could not find files with pattern %s: %w", filePattern, err)
-			}
-
-			for _, filePath := range matchingFiles {
-				if addedFiles[filePath] {
-					continue
-				}
-				addedFiles[filePath] = true
-				// check if we already have embeddings for this file path
-				layerIdentifier := fmt.Sprintf("%s:%s:%s:%d", filePath, e.model, modelInfo.ModTime().Format("2006-01-02 15:04:05"), modelInfo.Size())
-				digest, _ := GetSHA256Digest(strings.NewReader(layerIdentifier))
-				existing, err := existingFileEmbeddings(digest)
-				if err != nil {
-					return nil, fmt.Errorf("failed to check existing embeddings for file %s: %v", filePath, err)
-				}
-
-				// TODO: check file type
-				f, err := os.Open(filePath)
-				if err != nil {
-					return nil, fmt.Errorf("could not open embed file: %w", err)
-				}
-				scanner := bufio.NewScanner(f)
-				scanner.Split(bufio.ScanLines)
-
-				data := []string{}
-				for scanner.Scan() {
-					data = append(data, scanner.Text())
-				}
-				f.Close()
-
-				// the digest of the file is set here so that the client knows a new operation is in progress
-				fileDigest, _ := GetSHA256Digest(bytes.NewReader([]byte(filePath)))
-
-				embeddings := []vector.Embedding{}
-				for i, d := range data {
-					if strings.TrimSpace(d) == "" {
-						continue
-					}
-					e.fn(api.ProgressResponse{
-						Status:    fmt.Sprintf("creating embeddings for file %s", filePath),
-						Digest:    fileDigest,
-						Total:     int64(len(data) - 1),
-						Completed: int64(i),
-					})
-					if len(existing[d]) > 0 {
-						// already have an embedding for this line
-						embeddings = append(embeddings, vector.Embedding{Data: d, Vector: existing[d]})
-						continue
-					}
-					embed, err := loaded.llm.Embedding(context.Background(), d)
-					if err != nil {
-						log.Printf("failed to generate embedding for '%s' line %d: %v", filePath, i+1, err)
-						continue
-					}
-					embeddings = append(embeddings, vector.Embedding{Data: d, Vector: embed})
-				}
-
-				b, err := json.Marshal(embeddings)
-				if err != nil {
-					return nil, fmt.Errorf("failed to encode embeddings: %w", err)
-				}
-				r := bytes.NewReader(b)
-
-				layer := &LayerReader{
-					Layer: Layer{
-						MediaType: "application/vnd.ollama.image.embed",
-						Digest:    digest,
-						Size:      r.Size(),
-					},
-					Reader: r,
-				}
-
-				layers = append(layers, layer)
-			}
-		}
-	}
-	return layers, nil
-}
-
-// existingFileEmbeddings checks if we already have embeddings for a file and loads them into a look-up map
-func existingFileEmbeddings(digest string) (map[string][]float64, error) {
-	path, err := GetBlobsPath(digest)
-	if err != nil {
-		return nil, fmt.Errorf("embeddings blobs path: %w", err)
-	}
-	existingFileEmbeddings := make(map[string][]float64)
-	if _, err := os.Stat(path); err == nil {
-		// already have some embeddings for this file, load embeddings previously generated
-		file, err := os.Open(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open existing embedding file: %s", err)
-		}
-		defer file.Close()
-
-		existing := []vector.Embedding{}
-		if err = json.NewDecoder(file).Decode(&existing); err != nil {
-			return nil, err
-		}
-		for _, e := range existing {
-			existingFileEmbeddings[e.Data] = e.Vector
-		}
-	}
-	return existingFileEmbeddings, nil
-}
-
 func removeLayerFromLayers(layers []*LayerReader, mediaType string) []*LayerReader {
 	return slices.DeleteFunc(layers, func(layer *LayerReader) bool {
 		return layer.MediaType == mediaType
@@ -727,8 +555,7 @@ func SaveLayers(layers []*LayerReader, fn func(resp api.ProgressResponse), force
 		}
 
 		_, err = os.Stat(fp)
-		// note: embed layers are always written since their digest doesnt indicate anything about the contents
-		if os.IsNotExist(err) || force || layer.MediaType == "application/vnd.ollama.image.embed" {
+		if os.IsNotExist(err) || force {
 			fn(api.ProgressResponse{Status: fmt.Sprintf("writing layer %s", layer.Digest)})
 
 			out, err := os.Create(fp)
@@ -768,8 +595,11 @@ func CreateManifest(name string, cfg *LayerReader, layers []*Layer) error {
 		return err
 	}
 
-	fp, err := mp.GetManifestPath(true)
+	fp, err := mp.GetManifestPath()
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 		return err
 	}
 	return os.WriteFile(fp, manifestJSON, 0o644)
@@ -883,14 +713,17 @@ func CreateLayer(f io.ReadSeeker) (*LayerReader, error) {
 
 func CopyModel(src, dest string) error {
 	srcModelPath := ParseModelPath(src)
-	srcPath, err := srcModelPath.GetManifestPath(false)
+	srcPath, err := srcModelPath.GetManifestPath()
 	if err != nil {
 		return err
 	}
 
 	destModelPath := ParseModelPath(dest)
-	destPath, err := destModelPath.GetManifestPath(true)
+	destPath, err := destModelPath.GetManifestPath()
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return err
 	}
 
@@ -1055,7 +888,7 @@ func DeleteModel(name string) error {
 		return err
 	}
 
-	fp, err := mp.GetManifestPath(false)
+	fp, err := mp.GetManifestPath()
 	if err != nil {
 		return err
 	}
@@ -1069,51 +902,27 @@ func DeleteModel(name string) error {
 }
 
 func ShowModelfile(model *Model) (string, error) {
-	type modelTemplate struct {
+	var mt struct {
 		*Model
-		From   string
-		Params string
+		From       string
+		Parameters map[string][]any
 	}
 
-	var params []string
+	mt.Parameters = make(map[string][]any)
 	for k, v := range model.Options {
-		switch val := v.(type) {
-		case string:
-			params = append(params, fmt.Sprintf("PARAMETER %s %s", k, val))
-		case int:
-			params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.Itoa(val)))
-		case float64:
-			params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.FormatFloat(val, 'f', 0, 64)))
-		case bool:
-			params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.FormatBool(val)))
-		case []interface{}:
-			for _, nv := range val {
-				switch nval := nv.(type) {
-				case string:
-					params = append(params, fmt.Sprintf("PARAMETER %s %s", k, nval))
-				case int:
-					params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.Itoa(nval)))
-				case float64:
-					params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.FormatFloat(nval, 'f', 0, 64)))
-				case bool:
-					params = append(params, fmt.Sprintf("PARAMETER %s %s", k, strconv.FormatBool(nval)))
-				default:
-					log.Printf("unknown type: %s", reflect.TypeOf(nv).String())
-				}
-			}
-		default:
-			log.Printf("unknown type: %s", reflect.TypeOf(v).String())
+		if s, ok := v.([]any); ok {
+			mt.Parameters[k] = s
+			continue
 		}
+
+		mt.Parameters[k] = []any{v}
 	}
 
-	mt := modelTemplate{
-		Model:  model,
-		From:   model.OriginalModel,
-		Params: strings.Join(params, "\n"),
-	}
+	mt.Model = model
+	mt.From = model.ModelPath
 
-	if mt.From == "" {
-		mt.From = model.ModelPath
+	if model.OriginalModel != "" {
+		mt.From = model.OriginalModel
 	}
 
 	modelFile := `# Modelfile generated by "ollama show"
@@ -1122,12 +931,20 @@ func ShowModelfile(model *Model) (string, error) {
 
 FROM {{ .From }}
 TEMPLATE """{{ .Template }}"""
+
+{{- if .System }}
 SYSTEM """{{ .System }}"""
-{{ .Params }}
-`
-	for _, l := range mt.Model.AdapterPaths {
-		modelFile += fmt.Sprintf("ADAPTER %s\n", l)
-	}
+{{- end }}
+
+{{- range $adapter := .AdapterPaths }}
+ADAPTER {{ $adapter }}
+{{- end }}
+
+{{- range $k, $v := .Parameters }}
+{{- range $parameter := $v }}
+PARAMETER {{ $k }} {{ printf "%#v" $parameter }}
+{{- end }}
+{{- end }}`
 
 	tmpl, err := template.New("").Parse(modelFile)
 	if err != nil {
@@ -1310,8 +1127,11 @@ func PullModel(ctx context.Context, name string, regOpts *RegistryOptions, fn fu
 		return err
 	}
 
-	fp, err := mp.GetManifestPath(true)
+	fp, err := mp.GetManifestPath()
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(fp), 0o755); err != nil {
 		return err
 	}
 

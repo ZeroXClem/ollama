@@ -23,11 +23,10 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
-	"gonum.org/v1/gonum/mat"
 
 	"github.com/jmorganca/ollama/api"
 	"github.com/jmorganca/ollama/llm"
-	"github.com/jmorganca/ollama/vector"
+	"github.com/jmorganca/ollama/version"
 )
 
 var mode string = gin.DebugMode
@@ -47,14 +46,13 @@ func init() {
 var loaded struct {
 	mu sync.Mutex
 
-	llm        llm.LLM
-	Embeddings []vector.Embedding
+	runner llm.LLM
 
 	expireAt    time.Time
 	expireTimer *time.Timer
 
-	digest  string
-	options api.Options
+	*Model
+	*api.Options
 }
 
 var defaultSessionDuration = 5 * time.Minute
@@ -68,70 +66,55 @@ func load(ctx context.Context, workDir string, model *Model, reqOpts map[string]
 	}
 
 	if err := opts.FromMap(reqOpts); err != nil {
-		log.Printf("could not merge model options: %v", err)
 		return err
 	}
 
 	// check if the loaded model is still running in a subprocess, in case something unexpected happened
-	if loaded.llm != nil {
-		if err := loaded.llm.Ping(ctx); err != nil {
+	if loaded.runner != nil {
+		if err := loaded.runner.Ping(ctx); err != nil {
 			log.Print("loaded llm process not responding, closing now")
 			// the subprocess is no longer running, so close it
-			loaded.llm.Close()
-			loaded.llm = nil
-			loaded.digest = ""
+			loaded.runner.Close()
+			loaded.runner = nil
+			loaded.Model = nil
+			loaded.Options = nil
 		}
 	}
 
-	if model.Digest != loaded.digest || !reflect.DeepEqual(loaded.options, opts) {
-		if loaded.llm != nil {
+	needLoad := loaded.runner == nil || // is there a model loaded?
+		loaded.ModelPath != model.ModelPath || // has the base model changed?
+		!reflect.DeepEqual(loaded.AdapterPaths, model.AdapterPaths) || // have the adapters changed?
+		!reflect.DeepEqual(loaded.Options.Runner, opts.Runner) // have the runner options changed?
+
+	if needLoad {
+		if loaded.runner != nil {
 			log.Println("changing loaded model")
-			loaded.llm.Close()
-			loaded.llm = nil
-			loaded.digest = ""
+			loaded.runner.Close()
+			loaded.runner = nil
+			loaded.Model = nil
+			loaded.Options = nil
 		}
 
-		if model.Embeddings != nil && len(model.Embeddings) > 0 {
-			opts.EmbeddingOnly = true // this is requried to generate embeddings, completions will still work
-			loaded.Embeddings = model.Embeddings
-		}
-
-		llmModel, err := llm.New(workDir, model.ModelPath, model.AdapterPaths, opts)
+		llmRunner, err := llm.New(workDir, model.ModelPath, model.AdapterPaths, opts)
 		if err != nil {
+			// some older models are not compatible with newer versions of llama.cpp
+			// show a generalized compatibility error until there is a better way to
+			// check for model compatibility
+			if strings.Contains(err.Error(), "failed to load model") {
+				err = fmt.Errorf("%v: this model may be incompatible with your version of Ollama. If you previously pulled this model, try updating it by running `ollama pull %s`", err, model.ShortName)
+			}
+
 			return err
 		}
 
-		// set cache values before modifying opts
-		loaded.llm = llmModel
-		loaded.digest = model.Digest
-		loaded.options = opts
-
-		if opts.NumKeep < 0 {
-			promptWithSystem, err := model.Prompt(api.GenerateRequest{}, "")
-			if err != nil {
-				return err
-			}
-
-			promptNoSystem, err := model.Prompt(api.GenerateRequest{Context: []int{0}}, "")
-			if err != nil {
-				return err
-			}
-
-			tokensWithSystem, err := llmModel.Encode(ctx, promptWithSystem)
-			if err != nil {
-				return err
-			}
-
-			tokensNoSystem, err := llmModel.Encode(ctx, promptNoSystem)
-			if err != nil {
-				return err
-			}
-
-			opts.NumKeep = len(tokensWithSystem) - len(tokensNoSystem)
-
-			llmModel.SetOptions(opts)
-		}
+		loaded.Model = model
+		loaded.runner = llmRunner
+		loaded.Options = &opts
 	}
+
+	// update options for the loaded llm
+	// TODO(mxyng): this isn't thread safe, but it should be fine for now
+	loaded.runner.SetOptions(opts)
 
 	loaded.expireAt = time.Now().Add(sessionDuration)
 
@@ -144,13 +127,13 @@ func load(ctx context.Context, workDir string, model *Model, reqOpts map[string]
 				return
 			}
 
-			if loaded.llm == nil {
-				return
+			if loaded.runner != nil {
+				loaded.runner.Close()
 			}
 
-			loaded.llm.Close()
-			loaded.llm = nil
-			loaded.digest = ""
+			loaded.runner = nil
+			loaded.Model = nil
+			loaded.Options = nil
 		})
 	}
 
@@ -165,8 +148,18 @@ func GenerateHandler(c *gin.Context) {
 	checkpointStart := time.Now()
 
 	var req api.GenerateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Model == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
 		return
 	}
 
@@ -186,28 +179,17 @@ func GenerateHandler(c *gin.Context) {
 	// TODO: set this duration from the request if specified
 	sessionDuration := defaultSessionDuration
 	if err := load(c.Request.Context(), workDir, model, req.Options, sessionDuration); err != nil {
+		if errors.Is(err, api.ErrInvalidOpts) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	checkpointLoaded := time.Now()
 
-	embedding := ""
-	if model.Embeddings != nil && len(model.Embeddings) > 0 {
-		promptEmbed, err := loaded.llm.Embedding(c.Request.Context(), req.Prompt)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		// TODO: set embed_top from specified parameters in modelfile
-		embed_top := 3
-		topK := vector.TopK(embed_top, mat.NewVecDense(len(promptEmbed), promptEmbed), loaded.Embeddings)
-		for _, e := range topK {
-			embedding = fmt.Sprintf("%s %s", embedding, e.Embedding.Data)
-		}
-	}
-
-	prompt, err := model.Prompt(req, embedding)
+	prompt, err := model.Prompt(req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -216,6 +198,12 @@ func GenerateHandler(c *gin.Context) {
 	ch := make(chan any)
 	go func() {
 		defer close(ch)
+		// an empty request loads the model
+		if req.Prompt == "" && req.Template == "" && req.System == "" {
+			ch <- api.GenerateResponse{CreatedAt: time.Now().UTC(), Model: req.Model, Done: true}
+			return
+		}
+
 		fn := func(r api.GenerateResponse) {
 			loaded.expireAt = time.Now().Add(sessionDuration)
 			loaded.expireTimer.Reset(sessionDuration)
@@ -230,13 +218,8 @@ func GenerateHandler(c *gin.Context) {
 			ch <- r
 		}
 
-		// an empty request loads the model
-		if req.Prompt == "" && req.Template == "" && req.System == "" {
-			ch <- api.GenerateResponse{Model: req.Model, Done: true}
-		} else {
-			if err := loaded.llm.Predict(c.Request.Context(), req.Context, prompt, fn); err != nil {
-				ch <- gin.H{"error": err.Error()}
-			}
+		if err := loaded.runner.Predict(c.Request.Context(), req.Context, prompt, fn); err != nil {
+			ch <- gin.H{"error": err.Error()}
 		}
 	}()
 
@@ -265,8 +248,18 @@ func EmbeddingHandler(c *gin.Context) {
 	defer loaded.mu.Unlock()
 
 	var req api.EmbeddingRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Model == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "model is required"})
 		return
 	}
 
@@ -282,12 +275,12 @@ func EmbeddingHandler(c *gin.Context) {
 		return
 	}
 
-	if !loaded.options.EmbeddingOnly {
+	if !loaded.Options.EmbeddingOnly {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "embedding option must be set to true"})
 		return
 	}
 
-	embedding, err := loaded.llm.Embedding(c.Request.Context(), req.Prompt)
+	embedding, err := loaded.runner.Embedding(c.Request.Context(), req.Prompt)
 	if err != nil {
 		log.Printf("embedding generation failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate embedding"})
@@ -302,8 +295,18 @@ func EmbeddingHandler(c *gin.Context) {
 
 func PullModelHandler(c *gin.Context) {
 	var req api.PullRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Name == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 
@@ -336,8 +339,18 @@ func PullModelHandler(c *gin.Context) {
 
 func PushModelHandler(c *gin.Context) {
 	var req api.PushRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Name == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 
@@ -368,12 +381,20 @@ func PushModelHandler(c *gin.Context) {
 
 func CreateModelHandler(c *gin.Context) {
 	var req api.CreateRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	workDir := c.GetString("workDir")
+	if req.Name == "" || req.Path == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "name and path are required"})
+		return
+	}
 
 	ch := make(chan any)
 	go func() {
@@ -385,7 +406,7 @@ func CreateModelHandler(c *gin.Context) {
 		ctx, cancel := context.WithCancel(c.Request.Context())
 		defer cancel()
 
-		if err := CreateModel(ctx, workDir, req.Name, req.Path, fn); err != nil {
+		if err := CreateModel(ctx, req.Name, req.Path, fn); err != nil {
 			ch <- gin.H{"error": err.Error()}
 		}
 	}()
@@ -400,8 +421,18 @@ func CreateModelHandler(c *gin.Context) {
 
 func DeleteModelHandler(c *gin.Context) {
 	var req api.DeleteRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Name == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 
@@ -430,8 +461,18 @@ func DeleteModelHandler(c *gin.Context) {
 
 func ShowModelHandler(c *gin.Context) {
 	var req api.ShowRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Name == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
 
@@ -500,7 +541,7 @@ func GetModelInfo(name string) (*api.ShowResponse, error) {
 }
 
 func ListModelsHandler(c *gin.Context) {
-	var models []api.ModelResponse
+	models := make([]api.ModelResponse, 0)
 	fp, err := GetManifestPath()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -541,8 +582,18 @@ func ListModelsHandler(c *gin.Context) {
 
 func CopyModelHandler(c *gin.Context) {
 	var req api.CopyRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	err := c.ShouldBindJSON(&req)
+	switch {
+	case errors.Is(err, io.EOF):
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "missing request body"})
+		return
+	case err != nil:
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Source == "" || req.Destination == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "source add destination are required"})
 		return
 	}
 
@@ -608,7 +659,7 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 		r.Handle(method, "/api/tags", ListModelsHandler)
 	}
 
-	log.Printf("Listening on %s", ln.Addr())
+	log.Printf("Listening on %s (version %s)", ln.Addr(), version.Version)
 	s := &http.Server{
 		Handler: r,
 	}
@@ -618,8 +669,8 @@ func Serve(ln net.Listener, allowOrigins []string) error {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-signals
-		if loaded.llm != nil {
-			loaded.llm.Close()
+		if loaded.runner != nil {
+			loaded.runner.Close()
 		}
 		os.RemoveAll(workDir)
 		os.Exit(0)

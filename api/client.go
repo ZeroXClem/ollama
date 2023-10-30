@@ -14,12 +14,9 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/jmorganca/ollama/format"
 	"github.com/jmorganca/ollama/version"
 )
-
-const DefaultHost = "127.0.0.1:11434"
-
-var envHost = os.Getenv("OLLAMA_HOST")
 
 type Client struct {
 	base *url.URL
@@ -43,16 +40,28 @@ func checkError(resp *http.Response, body []byte) error {
 }
 
 func ClientFromEnvironment() (*Client, error) {
+	defaultPort := "11434"
+
 	scheme, hostport, ok := strings.Cut(os.Getenv("OLLAMA_HOST"), "://")
-	if !ok {
+	switch {
+	case !ok:
 		scheme, hostport = "http", os.Getenv("OLLAMA_HOST")
+	case scheme == "http":
+		defaultPort = "80"
+	case scheme == "https":
+		defaultPort = "443"
 	}
+
+	// trim trailing slashes
+	hostport = strings.TrimRight(hostport, "/")
 
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
-		host, port = "127.0.0.1", "11434"
-		if ip := net.ParseIP(strings.Trim(os.Getenv("OLLAMA_HOST"), "[]")); ip != nil {
+		host, port = "127.0.0.1", defaultPort
+		if ip := net.ParseIP(strings.Trim(hostport, "[]")); ip != nil {
 			host = ip.String()
+		} else if hostport != "" {
+			host = hostport
 		}
 	}
 
@@ -127,7 +136,7 @@ func (c *Client) do(ctx context.Context, method, path string, reqData, respData 
 	return nil
 }
 
-const maxBufferSize = 512 * 1000 // 512KB
+const maxBufferSize = 512 * format.KiloByte
 
 func (c *Client) stream(ctx context.Context, method, path string, data any, fn func([]byte) error) error {
 	var buf *bytes.Buffer

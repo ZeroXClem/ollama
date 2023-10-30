@@ -22,7 +22,6 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/olekukonko/tablewriter"
-	"github.com/pdevine/readline"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/term"
@@ -30,29 +29,10 @@ import (
 	"github.com/jmorganca/ollama/api"
 	"github.com/jmorganca/ollama/format"
 	"github.com/jmorganca/ollama/progressbar"
+	"github.com/jmorganca/ollama/readline"
 	"github.com/jmorganca/ollama/server"
 	"github.com/jmorganca/ollama/version"
 )
-
-type Painter struct {
-	IsMultiLine bool
-}
-
-func (p Painter) Paint(line []rune, _ int) []rune {
-	termType := os.Getenv("TERM")
-	if termType == "xterm-256color" && len(line) == 0 {
-		var prompt string
-		if p.IsMultiLine {
-			prompt = "Use \"\"\" to end multi-line input"
-		} else {
-			prompt = "Send a message (/? for help)"
-		}
-		return []rune(fmt.Sprintf("\033[38;5;245m%s\033[%dD\033[0m", prompt, len(prompt)))
-	}
-	// add a space and a backspace to prevent the cursor from walking up the screen
-	line = append(line, []rune(" \b")...)
-	return line
-}
 
 func CreateHandler(cmd *cobra.Command, args []string) error {
 	filename, _ := cmd.Flags().GetString("file")
@@ -78,18 +58,12 @@ func CreateHandler(cmd *cobra.Command, args []string) error {
 				spinner.Stop()
 			}
 			currentDigest = resp.Digest
-			switch {
-			case strings.Contains(resp.Status, "embeddings"):
-				bar = progressbar.Default(resp.Total, resp.Status)
-				bar.Set64(resp.Completed)
-			default:
-				// pulling
-				bar = progressbar.DefaultBytes(
-					resp.Total,
-					resp.Status,
-				)
-				bar.Set64(resp.Completed)
-			}
+			// pulling
+			bar = progressbar.DefaultBytes(
+				resp.Total,
+				resp.Status,
+			)
+			bar.Set64(resp.Completed)
 		} else if resp.Digest == currentDigest && resp.Digest != "" {
 			bar.Set64(resp.Completed)
 		} else {
@@ -479,18 +453,7 @@ func generate(cmd *cobra.Command, model, prompt string, wordWrap bool) error {
 	}
 
 	if err := client.Generate(cancelCtx, &request, fn); err != nil {
-		if strings.Contains(err.Error(), "failed to load model") {
-			// tell the user to check the server log, if it exists locally
-			home, nestedErr := os.UserHomeDir()
-			if nestedErr != nil {
-				// return the original error
-				return err
-			}
-			logPath := filepath.Join(home, ".ollama", "logs", "server.log")
-			if _, nestedErr := os.Stat(logPath); nestedErr == nil {
-				err = fmt.Errorf("%w\nFor more details, check the error logs at %s", err, logPath)
-			}
-		} else if strings.Contains(err.Error(), "context canceled") && abort {
+		if strings.Contains(err.Error(), "context canceled") && abort {
 			spinner.Finish()
 			return nil
 		}
@@ -525,37 +488,10 @@ func generate(cmd *cobra.Command, model, prompt string, wordWrap bool) error {
 }
 
 func generateInteractive(cmd *cobra.Command, model string) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-
 	// load the model
 	if err := generate(cmd, model, "", false); err != nil {
 		return err
 	}
-
-	completer := readline.NewPrefixCompleter(
-		readline.PcItem("/help"),
-		readline.PcItem("/list"),
-		readline.PcItem("/set",
-			readline.PcItem("history"),
-			readline.PcItem("nohistory"),
-			readline.PcItem("wordwrap"),
-			readline.PcItem("nowordwrap"),
-			readline.PcItem("verbose"),
-			readline.PcItem("quiet"),
-		),
-		readline.PcItem("/show",
-			readline.PcItem("license"),
-			readline.PcItem("modelfile"),
-			readline.PcItem("parameters"),
-			readline.PcItem("system"),
-			readline.PcItem("template"),
-		),
-		readline.PcItem("/exit"),
-		readline.PcItem("/bye"),
-	)
 
 	usage := func() {
 		fmt.Fprintln(os.Stderr, "Available Commands:")
@@ -589,20 +525,17 @@ func generateInteractive(cmd *cobra.Command, model string) error {
 		fmt.Fprintln(os.Stderr, "")
 	}
 
-	var painter Painter
-
-	config := readline.Config{
-		Painter:      &painter,
-		Prompt:       ">>> ",
-		HistoryFile:  filepath.Join(home, ".ollama", "history"),
-		AutoComplete: completer,
+	prompt := readline.Prompt{
+		Prompt:         ">>> ",
+		AltPrompt:      "... ",
+		Placeholder:    "Send a message (/? for help)",
+		AltPlaceholder: `Use """ to end multi-line input`,
 	}
 
-	scanner, err := readline.NewEx(&config)
+	scanner, err := readline.New(prompt)
 	if err != nil {
 		return err
 	}
-	defer scanner.Close()
 
 	var wordWrap bool
 	termType := os.Getenv("TERM")
@@ -619,17 +552,20 @@ func generateInteractive(cmd *cobra.Command, model string) error {
 		wordWrap = false
 	}
 
+	fmt.Print(readline.StartBracketedPaste)
+	defer fmt.Printf(readline.EndBracketedPaste)
+
 	var multiLineBuffer string
-	var isMultiLine bool
 
 	for {
 		line, err := scanner.Readline()
 		switch {
 		case errors.Is(err, io.EOF):
+			fmt.Println()
 			return nil
 		case errors.Is(err, readline.ErrInterrupt):
 			if line == "" {
-				fmt.Println("Use Ctrl-D or /bye to exit.")
+				fmt.Println("\nUse Ctrl-D or /bye to exit.")
 			}
 
 			continue
@@ -640,23 +576,19 @@ func generateInteractive(cmd *cobra.Command, model string) error {
 		line = strings.TrimSpace(line)
 
 		switch {
-		case isMultiLine:
+		case scanner.Prompt.UseAlt:
 			if strings.HasSuffix(line, `"""`) {
-				isMultiLine = false
-				painter.IsMultiLine = isMultiLine
+				scanner.Prompt.UseAlt = false
 				multiLineBuffer += strings.TrimSuffix(line, `"""`)
 				line = multiLineBuffer
 				multiLineBuffer = ""
-				scanner.SetPrompt(">>> ")
 			} else {
 				multiLineBuffer += line + " "
 				continue
 			}
 		case strings.HasPrefix(line, `"""`):
-			isMultiLine = true
-			painter.IsMultiLine = isMultiLine
+			scanner.Prompt.UseAlt = true
 			multiLineBuffer = strings.TrimPrefix(line, `"""`) + " "
-			scanner.SetPrompt("... ")
 			continue
 		case strings.HasPrefix(line, "/list"):
 			args := strings.Fields(line)
@@ -683,19 +615,6 @@ func generateInteractive(cmd *cobra.Command, model string) error {
 				case "quiet":
 					cmd.Flags().Set("verbose", "false")
 					fmt.Println("Set 'quiet' mode.")
-				case "mode":
-					if len(args) > 2 {
-						switch args[2] {
-						case "vim":
-							scanner.SetVimMode(true)
-						case "emacs", "default":
-							scanner.SetVimMode(false)
-						default:
-							usage()
-						}
-					} else {
-						usage()
-					}
 				default:
 					fmt.Printf("Unknown command '/set %s'. Type /? for help\n", args[1])
 				}
@@ -705,7 +624,12 @@ func generateInteractive(cmd *cobra.Command, model string) error {
 		case strings.HasPrefix(line, "/show"):
 			args := strings.Fields(line)
 			if len(args) > 1 {
-				resp, err := server.GetModelInfo(model)
+				client, err := api.ClientFromEnvironment()
+				if err != nil {
+					fmt.Println("error: couldn't connect to ollama server")
+					return err
+				}
+				resp, err := client.Show(cmd.Context(), &api.ShowRequest{Name: model})
 				if err != nil {
 					fmt.Println("error: couldn't get model")
 					return err
@@ -944,7 +868,7 @@ func NewCLI() *cobra.Command {
 	createCmd := &cobra.Command{
 		Use:     "create MODEL",
 		Short:   "Create a model from a Modelfile",
-		Args:    cobra.MinimumNArgs(1),
+		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    CreateHandler,
 	}
@@ -954,7 +878,7 @@ func NewCLI() *cobra.Command {
 	showCmd := &cobra.Command{
 		Use:     "show MODEL",
 		Short:   "Show information for a model",
-		Args:    cobra.MinimumNArgs(1),
+		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    ShowHandler,
 	}
@@ -981,13 +905,14 @@ func NewCLI() *cobra.Command {
 		Use:     "serve",
 		Aliases: []string{"start"},
 		Short:   "Start ollama",
+		Args:    cobra.ExactArgs(0),
 		RunE:    RunServer,
 	}
 
 	pullCmd := &cobra.Command{
 		Use:     "pull MODEL",
 		Short:   "Pull a model from a registry",
-		Args:    cobra.MinimumNArgs(1),
+		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PullHandler,
 	}
@@ -997,7 +922,7 @@ func NewCLI() *cobra.Command {
 	pushCmd := &cobra.Command{
 		Use:     "push MODEL",
 		Short:   "Push a model to a registry",
-		Args:    cobra.MinimumNArgs(1),
+		Args:    cobra.ExactArgs(1),
 		PreRunE: checkServerHeartbeat,
 		RunE:    PushHandler,
 	}
@@ -1013,15 +938,15 @@ func NewCLI() *cobra.Command {
 	}
 
 	copyCmd := &cobra.Command{
-		Use:     "cp",
+		Use:     "cp SOURCE TARGET",
 		Short:   "Copy a model",
-		Args:    cobra.MinimumNArgs(2),
+		Args:    cobra.ExactArgs(2),
 		PreRunE: checkServerHeartbeat,
 		RunE:    CopyHandler,
 	}
 
 	deleteCmd := &cobra.Command{
-		Use:     "rm",
+		Use:     "rm MODEL [MODEL...]",
 		Short:   "Remove a model",
 		Args:    cobra.MinimumNArgs(1),
 		PreRunE: checkServerHeartbeat,

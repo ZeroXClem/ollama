@@ -12,7 +12,6 @@ A model file is the blueprint to create and share models with Ollama.
   - [FROM (Required)](#from-required)
     - [Build from llama2](#build-from-llama2)
     - [Build from a bin file](#build-from-a-bin-file)
-  - [EMBED](#embed)
   - [PARAMETER](#parameter)
     - [Valid Parameters and Values](#valid-parameters-and-values)
   - [TEMPLATE](#template)
@@ -91,17 +90,6 @@ FROM ./ollama-model.bin
 
 This bin file location should be specified as an absolute path or relative to the `Modelfile` location.
 
-### EMBED
-
-The `EMBED` instruction is used to add embeddings of files to a model. This is useful for adding custom data that the model can reference when generating an answer. Note that currently only text files are supported, formatted with each line as one embedding.
-
-```modelfile
-FROM <model name>:<tag>
-EMBED <file path>.txt
-EMBED <different file path>.txt
-EMBED <path to directory>/*.txt
-```
-
 ### PARAMETER
 
 The `PARAMETER` instruction defines a parameter that can be set when the model is run.
@@ -124,6 +112,7 @@ PARAMETER <parameter> <parametervalue>
 | repeat_last_n  | Sets how far back for the model to look back to prevent repetition. (Default: 64, 0 = disabled, -1 = num_ctx)                                                                                                                                           | int        | repeat_last_n 64     |
 | repeat_penalty | Sets how strongly to penalize repetitions. A higher value (e.g., 1.5) will penalize repetitions more strongly, while a lower value (e.g., 0.9) will be more lenient. (Default: 1.1)                                                                     | float      | repeat_penalty 1.1   |
 | temperature    | The temperature of the model. Increasing the temperature will make the model answer more creatively. (Default: 0.8)                                                                                                                                     | float      | temperature 0.7      |
+| seed | Sets the random number seed to use for generation. Setting this to a specific number will make the model generate the same text for the same prompt. (Default: 0) | int | seed 42 |
 | stop           | Sets the stop sequences to use.                                                                                                                                                                                                                         | string     | stop "AI assistant:" |
 | tfs_z          | Tail free sampling is used to reduce the impact of less probable tokens from the output. A higher value (e.g., 2.0) will reduce the impact more, while a value of 1.0 disables this setting. (default: 1)                                               | float      | tfs_z 1              |
 | num_predict    | Maximum number of tokens to predict when generating text. (Default: 128, -1 = infinite generation, -2 = fill context)                                                                                                                                   | int        | num_predict 42       |
@@ -132,7 +121,7 @@ PARAMETER <parameter> <parametervalue>
 
 ### TEMPLATE
 
-`TEMPLATE` of the full prompt template to be passed into the model. It may include (optionally) a system prompt and a user's prompt. This is used to create a full custom prompt, and syntax may be model specific.
+`TEMPLATE` of the full prompt template to be passed into the model. It may include (optionally) a system prompt and a user's prompt. This is used to create a full custom prompt, and syntax may be model specific. You can usually find the template for a given model in the readme for that model.
 
 #### Template Variables
 

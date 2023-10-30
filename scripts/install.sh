@@ -26,7 +26,8 @@ require() {
 
 [ "$(uname -s)" = "Linux" ] || error 'This script is intended to run on Linux only.'
 
-case "$(uname -m)" in
+ARCH=$(uname -m)
+case "$ARCH" in
     x86_64) ARCH="amd64" ;;
     aarch64|arm64) ARCH="arm64" ;;
     *) error "Unsupported architecture: $ARCH" ;;
@@ -73,6 +74,9 @@ configure_systemd() {
         $SUDO useradd -r -s /bin/false -m -d /usr/share/ollama ollama
     fi
 
+    status "Adding current user to ollama group..."
+    $SUDO usermod -a -G ollama $(whoami)
+
     status "Creating ollama systemd service..."
     cat <<EOF | $SUDO tee /etc/systemd/system/ollama.service >/dev/null
 [Unit]
@@ -85,7 +89,6 @@ User=ollama
 Group=ollama
 Restart=always
 RestartSec=3
-Environment="HOME=/usr/share/ollama"
 Environment="PATH=$PATH"
 
 [Install]
