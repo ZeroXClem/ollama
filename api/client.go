@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -20,7 +21,7 @@ import (
 
 type Client struct {
 	base *url.URL
-	http http.Client
+	http *http.Client
 }
 
 func checkError(resp *http.Response, body []byte) error {
@@ -65,41 +66,32 @@ func ClientFromEnvironment() (*Client, error) {
 		}
 	}
 
-	client := Client{
+	return &Client{
 		base: &url.URL{
 			Scheme: scheme,
 			Host:   net.JoinHostPort(host, port),
 		},
-	}
-
-	mockRequest, err := http.NewRequest(http.MethodHead, client.base.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	proxyURL, err := http.ProxyFromEnvironment(mockRequest)
-	if err != nil {
-		return nil, err
-	}
-
-	client.http = http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-	}
-
-	return &client, nil
+		http: http.DefaultClient,
+	}, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, reqData, respData any) error {
 	var reqBody io.Reader
 	var data []byte
 	var err error
-	if reqData != nil {
+
+	switch reqData := reqData.(type) {
+	case io.Reader:
+		// reqData is already an io.Reader
+		reqBody = reqData
+	case nil:
+		// noop
+	default:
 		data, err = json.Marshal(reqData)
 		if err != nil {
 			return err
 		}
+
 		reqBody = bytes.NewReader(data)
 	}
 
@@ -212,6 +204,19 @@ func (c *Client) Generate(ctx context.Context, req *GenerateRequest, fn Generate
 	})
 }
 
+type ChatResponseFunc func(ChatResponse) error
+
+func (c *Client) Chat(ctx context.Context, req *ChatRequest, fn ChatResponseFunc) error {
+	return c.stream(ctx, http.MethodPost, "/api/chat", req, func(bts []byte) error {
+		var resp ChatResponse
+		if err := json.Unmarshal(bts, &resp); err != nil {
+			return err
+		}
+
+		return fn(resp)
+	})
+}
+
 type PullProgressFunc func(ProgressResponse) error
 
 func (c *Client) Pull(ctx context.Context, req *PullRequest, fn PullProgressFunc) error {
@@ -286,4 +291,38 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+func (c *Client) Embeddings(ctx context.Context, req *EmbeddingRequest) (*EmbeddingResponse, error) {
+	var resp EmbeddingResponse
+	if err := c.do(ctx, http.MethodPost, "/api/embeddings", req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (c *Client) CreateBlob(ctx context.Context, digest string, r io.Reader) error {
+	if err := c.do(ctx, http.MethodHead, fmt.Sprintf("/api/blobs/%s", digest), nil, nil); err != nil {
+		var statusError StatusError
+		if !errors.As(err, &statusError) || statusError.StatusCode != http.StatusNotFound {
+			return err
+		}
+
+		if err := c.do(ctx, http.MethodPost, fmt.Sprintf("/api/blobs/%s", digest), r, nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *Client) Version(ctx context.Context) (string, error) {
+	var version struct {
+		Version string `json:"version"`
+	}
+
+	if err := c.do(ctx, http.MethodGet, "/api/version", nil, &version); err != nil {
+		return "", err
+	}
+
+	return version.Version, nil
 }
